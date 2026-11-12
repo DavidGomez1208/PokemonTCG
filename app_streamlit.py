@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+
+
 import streamlit as st
 import kagglehub
 import numpy as np
@@ -15,58 +17,114 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-st.title("Precios de Cartas Pokémon TCG")
-st.write("Análisis rápido de estadísticas y modelo predictivo de precios.")
+st.title("Análisis de precios de Pokémon TCG")
+st.write(
+)
 
-@st.cache_data
+
+@st.cache_data(show_spinner="Descargando y preparando los datasets...")
 def cargar_datos():
-    df_stats = kagglehub.load_dataset(KaggleDatasetAdapter.PANDAS, "abcsds/pokemon", "Pokemon.csv")
-    df_precios = kagglehub.load_dataset(KaggleDatasetAdapter.PANDAS, "kanchana1990/e-commerce-pokmon-card-pricing-data", "pokemon_cards_ultimate_2026.csv")
-    
+    # Dataset con estadísticas de los Pokémon
+    df_stats = kagglehub.load_dataset(
+        KaggleDatasetAdapter.PANDAS,
+        "abcsds/pokemon",
+        "Pokemon.csv"
+    )
+
+    # Dataset con precios de cartas
+    df_precios = kagglehub.load_dataset(
+        KaggleDatasetAdapter.PANDAS,
+        "kanchana1990/e-commerce-pokmon-card-pricing-data",
+        "pokemon_cards_ultimate_2026.csv"
+    )
+
+    # Normalizar nombres para poder relacionar ambos datasets
     df_stats["name_clean"] = df_stats["Name"].astype(str).str.lower().str.strip()
-    df_precios["name_clean"] = df_precios["pokemon_name"].astype(str).str.lower().str.strip()
-    
+    df_precios["name_clean"] = (
+        df_precios["pokemon_name"].astype(str).str.lower().str.strip()
+    )
+
+    # Unir los datasets
     df = pd.merge(df_precios, df_stats, on="name_clean", how="inner")
+
+    # Asegurar que el precio sea numérico
     df["price_usd"] = pd.to_numeric(df["price_usd"], errors="coerce")
     return df
 
-@st.cache_data
+
+@st.cache_data(show_spinner="Entrenando el modelo...")
 def entrenar_modelo(df):
+    # Eliminar filas sin precio
     df_model = df.dropna(subset=["price_usd"]).copy()
-    columnas_excluir = ["price", "price_usd", "price_tier_usd", "currency", "Name", "name_clean", "#"]
-    features = [col for col in df_model.columns if col not in columnas_excluir]
+
+    # Excluir variables que revelan directamente el precio o identifican el registro
+    columnas_excluir = [
+        "price", "price_usd", "price_tier_usd", "currency",
+        "Name", "name_clean", "#"
+    ]
+    features = [
+        col for col in df_model.columns if col not in columnas_excluir
+    ]
 
     X = df_model[features]
     y = np.log1p(df_model["price_usd"])
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
 
+    # Detectar columnas numéricas y categóricas
     numeric_cols = X.select_dtypes(include=np.number).columns.tolist()
-    categorical_cols = X.select_dtypes(include=["object", "bool", "category"]).columns.tolist()
+    categorical_cols = X.select_dtypes(
+        include=["object", "bool", "category"]
+    ).columns.tolist()
 
-    preprocessor = ColumnTransformer(transformers=[
-        ("num", Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]), numeric_cols),
-        ("cat", Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value="missing")), ("onehot", OneHotEncoder(handle_unknown="ignore"))]), categorical_cols)
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
     ])
 
-    model = Pipeline([
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", numeric_transformer, numeric_cols),
+        ("cat", categorical_transformer, categorical_cols)
+    ])
+
+    model = Pipeline(steps=[
         ("preprocessor", preprocessor),
-        ("regressor", RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1))
+        ("regressor", RandomForestRegressor(
+            n_estimators=150,
+            max_depth=10,
+            random_state=42,
+            n_jobs=-1
+        ))
     ])
 
     model.fit(X_train, y_train)
 
+    # Predicciones y regreso a la escala original (USD)
     pred_log = model.predict(X_test)
     pred_usd = np.maximum(0, np.expm1(pred_log))
     test_usd = np.expm1(y_test)
 
     metrics = {
+        "r2_log": r2_score(y_test, pred_log),
         "r2_usd": r2_score(test_usd, pred_usd),
         "mae_usd": mean_absolute_error(test_usd, pred_usd)
     }
 
-    encoder = model.named_steps["preprocessor"].named_transformers_["cat"].named_steps["onehot"]
-    all_features = numeric_cols + encoder.get_feature_names_out(categorical_cols).tolist()
+    # Importancia de las variables
+    encoder = (
+        model.named_steps["preprocessor"]
+        .named_transformers_["cat"]
+        .named_steps["onehot"]
+    )
+    encoded_cat_cols = encoder.get_feature_names_out(categorical_cols).tolist()
+    all_features = numeric_cols + encoded_cat_cols
 
     importance = pd.DataFrame({
         "Característica": all_features,
@@ -74,69 +132,199 @@ def entrenar_modelo(df):
     }).sort_values("Importancia", ascending=False)
 
     comparison = pd.DataFrame({
-        "Precio real": test_usd,
-        "Precio predicho": pred_usd
+        "Precio real (USD)": test_usd,
+        "Precio predicho (USD)": pred_usd
     })
 
-    return metrics, importance, comparison
+    return model, metrics, importance, comparison
+
 
 try:
     df_completo = cargar_datos()
-    st.success(f"Datos cargados: {len(df_completo):,} registros.")
-except Exception as e:
-    st.error(f"Error al cargar los datos: {e}")
+except Exception as error:
+    st.error("No fue posible cargar los datasets de Kaggle.")
+    st.write(
+        "Comprueba tu conexión a internet y que KaggleHub pueda acceder "
+        "a los datasets."
+    )
+    st.exception(error)
     st.stop()
 
-# Métricas rápidas
-c1, c2, c3 = st.columns(3)
-c1.metric("Registros", f"{len(df_completo):,}")
-c2.metric("Pokémon únicos", f"{df_completo['name_clean'].nunique():,}")
-c3.metric("Precio promedio", f"${df_completo['price_usd'].mean():,.2f}")
 
-st.divider()
+if df_completo.empty:
+    st.warning("La unión de los datasets no produjo registros.")
+    st.stop()
 
-# Organización en dos pestañas más limpias
-tab1, tab2 = st.tabs(["📊 Exploración y Correlaciones", "🤖 Modelo Random Forest"])
+st.success(f"Datos cargados correctamente: {len(df_completo):,} registros.")
+
+# Métricas generales
+col1, col2, col3 = st.columns(3)
+col1.metric("Registros", f"{len(df_completo):,}")
+col2.metric(
+    "Pokémon diferentes",
+    f"{df_completo['name_clean'].nunique():,}"
+)
+col3.metric(
+    "Precio promedio",
+    f"${df_completo['price_usd'].mean():,.2f} USD"
+)
+
+with st.expander("Ver datos y columnas del dataset"):
+    st.dataframe(df_completo.head(20), use_container_width=True)
+    st.write("Información de las columnas:")
+    st.write(df_completo.dtypes.astype(str).to_frame("Tipo de dato"))
+
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Exploración",
+    "Correlaciones",
+    "Modelo predictivo",
+    "Importancia de variables"
+])
 
 with tab1:
-    st.subheader("Precio por Tipo Principal")
-    resumen_tipos = df_completo.dropna(subset=["Type 1", "price_usd"]).groupby("Type 1", as_index=False)["price_usd"].mean().sort_values("price_usd", ascending=False)
-    
-    fig, ax = plt.subplots(figsize=(10, 4))
-    sns.barplot(data=resumen_tipos, x="Type 1", y="price_usd", ax=ax)
-    plt.xticks(rotation=45)
-    st.pyplot(fig)
-    plt.close(fig)
+    st.subheader("Precio promedio según el tipo principal")
 
-    st.subheader("Matriz de Correlación")
-    cols_corr = [c for c in ["price_usd", "HP", "Attack", "Defense", "Speed", "Total"] if c in df_completo.columns]
-    fig, ax = plt.subplots(figsize=(7, 5))
-    sns.heatmap(df_completo[cols_corr].corr(numeric_only=True), annot=True, cmap="coolwarm", fmt=".2f", ax=ax)
-    st.pyplot(fig)
-    plt.close(fig)
+    if {"Type 1", "price_usd"}.issubset(df_completo.columns):
+        resumen_tipos = (
+            df_completo.dropna(subset=["Type 1", "price_usd"])
+            .groupby("Type 1", as_index=False)["price_usd"]
+            .mean()
+            .sort_values("price_usd", ascending=False)
+        )
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        sns.barplot(
+            data=resumen_tipos,
+            x="Type 1",
+            y="price_usd",
+            ax=ax
+        )
+        ax.set_xlabel("Tipo principal")
+        ax.set_ylabel("Precio promedio (USD)")
+        ax.set_title("Precio promedio de las cartas por tipo de Pokémon")
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.info("No se encontraron las columnas necesarias para esta gráfica.")
+
+    st.subheader("Resumen estadístico")
+    columnas_resumen = [
+        c for c in ["price_usd", "HP", "Attack", "Defense", "Total"]
+        if c in df_completo.columns
+    ]
+    st.dataframe(df_completo[columnas_resumen].describe(), use_container_width=True)
+
 
 with tab2:
-    st.subheader("Resultados del Modelo")
-    metrics, importancia, comparacion = entrenar_modelo(df_completo)
+    st.subheader("Correlación entre estadísticas y precio")
 
-    m1, m2 = st.columns(2)
-    m1.metric("R² Score (USD)", f"{metrics['r2_usd']:.4f}")
-    m2.metric("Error Absoluto Medio (MAE)", f"${metrics['mae_usd']:.2f}")
+    columnas_correlacion = [
+        c for c in [
+            "price_usd", "HP", "Attack", "Defense",
+            "Sp. Atk", "Sp. Def", "Speed", "Total"
+        ]
+        if c in df_completo.columns
+    ]
 
-    col_g1, col_g2 = st.columns(2)
-    with col_g1:
-        st.write("Real vs Predicho")
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.scatter(comparacion["Precio real"], comparacion["Precio predicho"], alpha=0.4)
-        min_v = min(comparacion["Precio real"].min(), comparacion["Precio predicho"].min())
-        max_v = max(comparacion["Precio real"].max(), comparacion["Precio predicho"].max())
-        ax.plot([min_v, max_v], [min_v, max_v], "r--")
+    matriz = df_completo[columnas_correlacion].corr(numeric_only=True)
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    sns.heatmap(
+        matriz,
+        annot=True,
+        cmap="coolwarm",
+        fmt=".2f",
+        ax=ax
+    )
+    ax.set_title("Correlación entre estadísticas de Pokémon y precio")
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.caption(
+        "Una correlación cercana a 1 indica una relación positiva; "
+        "cercana a -1, una relación negativa; y cercana a 0, una relación "
+        "lineal débil. Correlación no significa causalidad."
+    )
+
+
+with tab3:
+    st.subheader("Evaluación del modelo Random Forest")
+
+    try:
+        modelo, metricas, importancia, comparacion = entrenar_modelo(
+            df_completo
+        )
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("R² (escala logarítmica)", f"{metricas['r2_log']:.4f}")
+        m2.metric("R² (USD)", f"{metricas['r2_usd']:.4f}")
+        m3.metric("Error absoluto medio", f"${metricas['mae_usd']:.2f}")
+
+        st.write(
+            "El MAE representa, en promedio, cuánto se alejan las "
+            "predicciones del precio real, en dólares."
+        )
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(
+            comparacion["Precio real (USD)"],
+            comparacion["Precio predicho (USD)"],
+            alpha=0.5
+        )
+
+        minimo = min(
+            comparacion["Precio real (USD)"].min(),
+            comparacion["Precio predicho (USD)"].min()
+        )
+        maximo = max(
+            comparacion["Precio real (USD)"].max(),
+            comparacion["Precio predicho (USD)"].max()
+        )
+        ax.plot([minimo, maximo], [minimo, maximo], "r--", linewidth=2)
+        ax.set_xlabel("Precio real (USD)")
+        ax.set_ylabel("Precio predicho (USD)")
+        ax.set_title("Precios reales frente a precios predichos")
+        fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
 
-    with col_g2:
-        st.write("Top Variables Importantes")
-        fig, ax = plt.subplots(figsize=(5, 4))
-        sns.barplot(data=importancia.head(8), x="Importancia", y="Característica", ax=ax)
+    except Exception as error:
+        st.error("Ocurrió un problema al entrenar el modelo.")
+        st.exception(error)
+
+
+with tab4:
+    st.subheader("Las 10 características más importantes")
+
+    try:
+        # Se reutiliza el resultado almacenado en caché
+        _, _, importancia, _ = entrenar_modelo(df_completo)
+
+        top10 = importancia.head(10).sort_values(
+            "Importancia", ascending=True
+        )
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.barplot(
+            data=top10,
+            x="Importancia",
+            y="Característica",
+            ax=ax
+        )
+        ax.set_title("Top 10 de variables más importantes")
+        fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
+
+        st.dataframe(importancia.head(10), use_container_width=True)
+
+    except Exception as error:
+        st.error("No fue posible calcular la importancia de las variables.")
+        st.exception(error)
+
+st.divider()
+st.caption("Aplicación desarrollada con Python, Streamlit, Pandas y Scikit-learn.")
