@@ -62,7 +62,6 @@ df_completo = pd.merge(
 
 import kagglehub
 import pandas as pd
-!pip install -q kagglehub
 import numpy as np
 import os
 
